@@ -8,11 +8,11 @@ import time
 import pika_claude
 from pika_claude.core.bus.commands import PongResult
 from pika_claude.core.bus.envelope import JsonRpcError, JsonRpcSuccess
-from pika_claude.core.config import pikaConfig
+from pika_claude.core.config import PikaConfig
 
 
 # 同步入口：运行 ping 协程，连接失败时打印错误并退出
-def cmd_ping(config: pikaConfig) -> None:
+def cmd_ping(config: PikaConfig) -> None:
     try:
         asyncio.run(_ping(config))
     except (ConnectionRefusedError, OSError):
@@ -21,7 +21,7 @@ def cmd_ping(config: pikaConfig) -> None:
 
 
 # 向 core 守护进程发送 ping 请求，打印 pong 响应及延迟
-async def _ping(config: pikaConfig) -> None:
+async def _ping(config: PikaConfig) -> None:
     t0 = time.monotonic()
     reader, writer = await asyncio.open_connection(config.host, config.port)
 

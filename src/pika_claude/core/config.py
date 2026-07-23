@@ -11,9 +11,9 @@ from dotenv import load_dotenv
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 7437
 _DEFAULT_LOG_LEVEL = "INFO"
-_DEFAULT_LOG_FILE = "~/.kama/logs/core.log"
+_DEFAULT_LOG_FILE = "~/.pika/logs/core.log"
 _DEFAULT_LOG_FORMAT = "text"
-_DEFAULT_CONFIG_PATH = "~/.kama/config.toml"
+_DEFAULT_CONFIG_PATH = "~/.pika/config.toml"
 
 
 @dataclass
@@ -24,20 +24,20 @@ class LoggingConfig:
 
 
 @dataclass
-class KamaConfig:
+class PikaConfig:
     host: str = _DEFAULT_HOST
     port: int = _DEFAULT_PORT
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 
 # 构建并返回运行时配置：默认值 → TOML → .env → 系统环境变量（后者优先级最高）
-def get_config() -> KamaConfig:
-    config = KamaConfig()
+def get_config() -> PikaConfig:
+    config = PikaConfig()
 
-    # .env 必须在读取 KAMA_CONFIG 之前加载，以便 .env 中的 KAMA_CONFIG 能影响 TOML 路径
+    # .env 必须在读取 Pika_CONFIG 之前加载，以便 .env 中的 Pika_CONFIG 能影响 TOML 路径
     load_dotenv(".env", override=False)
 
-    config_path = Path(os.environ.get("KAMA_CONFIG", _DEFAULT_CONFIG_PATH)).expanduser()
+    config_path = Path(os.environ.get("Pika_CONFIG", _DEFAULT_CONFIG_PATH)).expanduser()
 
     if config_path.exists():
         try:
@@ -52,7 +52,7 @@ def get_config() -> KamaConfig:
 
 
 # 将已解析的 TOML 根表写入 config；未知小节或类型错误时退出进程
-def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
+def _apply_toml(config: PikaConfig, data: dict[str, Any]) -> None:
     unknown = set(data.keys()) - {"core", "logging"}
     if unknown:
         raise SystemExit(f"Unknown top-level config keys: {', '.join(sorted(unknown))}")
@@ -90,27 +90,27 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
                 setattr(config.logging, key, val)
 
 
-# 用 KAMA_* 环境变量覆盖 config 中对应字段（若变量已设置）
-def _apply_env(config: KamaConfig) -> None:
-    host = os.environ.get("KAMA_HOST")
+# 用 Pika_* 环境变量覆盖 config 中对应字段（若变量已设置）
+def _apply_env(config: PikaConfig) -> None:
+    host = os.environ.get("Pika_HOST")
     if host is not None:
         config.host = host
 
-    port_str = os.environ.get("KAMA_PORT")
+    port_str = os.environ.get("Pika_PORT")
     if port_str is not None:
         try:
             config.port = int(port_str)
         except ValueError:
-            raise SystemExit(f"Config error: KAMA_PORT must be an integer, got: {port_str!r}")
+            raise SystemExit(f"Config error: Pika_PORT must be an integer, got: {port_str!r}")
 
-    log_level = os.environ.get("KAMA_LOG_LEVEL")
+    log_level = os.environ.get("Pika_LOG_LEVEL")
     if log_level is not None:
         config.logging.level = log_level
 
-    log_file = os.environ.get("KAMA_LOG_FILE")
+    log_file = os.environ.get("Pika_LOG_FILE")
     if log_file is not None:
         config.logging.file = log_file
 
-    log_format = os.environ.get("KAMA_LOG_FORMAT")
+    log_format = os.environ.get("Pika_LOG_FORMAT")
     if log_format is not None:
         config.logging.format = log_format
