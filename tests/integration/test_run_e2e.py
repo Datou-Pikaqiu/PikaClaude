@@ -1,151 +1,105 @@
+"""
+End-to-end integration test for the S1 agent pipeline.
+
+Requires a real ANTHROPIC_API_KEY — skipped automatically when absent.
+Run explicitly:
+    uv run pytest tests/integration/test_run_e2e.py -v
+Or with the marker:
+    uv run pytest -m integration -v
+"""
 from __future__ import annotations
 
-import asyncio
-import subprocess
-from typing import Any
+import json
+import os
+from pathlib import Path
 
-from kama_claude.core.transport.socket_client import SocketClient
+import pytest
+from dotenv import load_dotenv
+
+from pika_claude.core.config import KamaConfig
+from pika_claude.core.runner import AgentRunner
+
+# Load project .env so ANTHROPIC_API_KEY is available without going through get_config()
+load_dotenv(Path(__file__).parent.parent.parent / ".env", override=False)
+
+pytestmark = pytest.mark.integration
 
 
-# 功能：验证 agent.run 命令返回非空 run_id，且 daemon 随即广播 run.started 事件
-# 设计：用 SocketClient 封装 IPC 层，asyncio.Event 等待事件而非轮询，
-#       timeout=5s 防测试挂起；run.started 在 LLM 调用前触发，无需真实 API Key
-async def test_agent_run_returns_run_id_and_emits_started(
-    running_daemon: subprocess.Popen[bytes],
-    free_port: int,
+@pytest.fixture()
+def sample_file(tmp_path: Path) -> Path:
+    f = tmp_path / "sample.txt"
+    f.write_text(
+        "# Test Document\n\nThe magic number mentioned in this file is 7391.\n",
+        encoding="utf-8",
+    )
+    return f
+
+
+# 功能：验证完整的端到端 agent 链路：调用真实 LLM → 执行 read_file → 成功完成并写入 events.jsonl
+# 设计：使用真实 ANTHROPIC_API_KEY 和真实文件，goal 中指定一个具体的数字（7391）以便断言 LLM 确实读了文件；
+#       通过 events.jsonl 的事件序列断言每个关键阶段都被记录，而非只检查 stdout，因为 events.jsonl 是 S1 的核心验收产物
+async def test_run_e2e_reads_file_and_succeeds(
+    sample_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = SocketClient("127.0.0.1", free_port)
-    await client.connect()
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        pytest.skip("ANTHROPIC_API_KEY not set")
 
-    started_event: asyncio.Event = asyncio.Event()
-    received: dict[str, Any] = {}
+    # ReadFileTool resolves paths relative to CWD — point it at tmp_path
+    monkeypatch.chdir(tmp_path)
 
-    async def on_event(event: dict[str, Any]) -> None:
-        if event.get("type") == "run.started":
-            received.update(event)
-            started_event.set()
+    goal = (
+        "Use the read_file tool to read the file 'sample.txt' "
+        "and report the magic number it mentions."
+    )
+    runs_dir = tmp_path / "runs"
 
-    client.on_event(on_event)
-    loop_task = asyncio.create_task(client.run_event_loop())
+    config = KamaConfig()
+    config.agent.max_steps = 5
 
-    try:
-        await client.send_command("event.subscribe", {"topics": ["run.*"], "scope": "global"})
-        result = await client.send_command("agent.run", {"goal": "hello"})
+    runner = AgentRunner(config, runs_dir=runs_dir)
+    await runner.run(goal)
 
-        assert result.get("run_id"), "run_id must be non-empty"
-        returned_run_id: str = result["run_id"]
+    # ── events.jsonl must exist ──────────────────────────────────────────────
+    jsonl_files = list(runs_dir.rglob("events.jsonl"))
+    assert len(jsonl_files) == 1, "expected exactly one events.jsonl"
 
-        await asyncio.wait_for(started_event.wait(), timeout=5.0)
-        assert received.get("run_id") == returned_run_id
-        assert received.get("goal") == "hello"
-    finally:
-        loop_task.cancel()
-        await asyncio.gather(loop_task, return_exceptions=True)
-        await client.close()
+    events = [
+        json.loads(line)
+        for line in jsonl_files[0].read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    types = [e["type"] for e in events]
 
+    # ── event sequence assertions (from §6.4) ────────────────────────────────
+    assert types[0] == "run.started"
+    assert types[-1] == "run.finished"
+    assert "step.started" in types
+    assert "tool.call_started" in types
+    assert "tool.call_finished" in types
+    assert "llm.usage" in types
 
-# 功能：验证两个独立客户端同时订阅后，其中一个触发 agent.run，两个都能收到 run.started 广播
-# 设计：两个 SocketClient 并行等待事件（asyncio.gather），确认 IpcEventBroadcaster 的扇出语义；
-#       不需要两个客户端都发命令，只验证广播覆盖所有订阅者
-async def test_two_clients_both_receive_broadcast(
-    running_daemon: subprocess.Popen[bytes],
-    free_port: int,
-) -> None:
-    client1 = SocketClient("127.0.0.1", free_port)
-    client2 = SocketClient("127.0.0.1", free_port)
-    await client1.connect()
-    await client2.connect()
+    # ── run completed successfully ────────────────────────────────────────────
+    finished = events[-1]
+    assert finished["status"] == "success", (
+        f"run finished with status={finished['status']!r}, reason={finished.get('reason')!r}"
+    )
 
-    event1: asyncio.Event = asyncio.Event()
-    event2: asyncio.Event = asyncio.Event()
+    # ── read_file was actually invoked ────────────────────────────────────────
+    tool_starts = [e for e in events if e["type"] == "tool.call_started"]
+    assert any(e["tool_name"] == "read_file" for e in tool_starts), (
+        "expected at least one read_file tool call"
+    )
 
-    async def on_event1(event: dict[str, Any]) -> None:
-        if event.get("type") == "run.started":
-            event1.set()
+    # ── run_id is consistent across the event stream ─────────────────────────
+    run_id = events[0]["run_id"]
+    assert all(e["run_id"] == run_id for e in events), "run_id must be the same in every event"
 
-    async def on_event2(event: dict[str, Any]) -> None:
-        if event.get("type") == "run.started":
-            event2.set()
-
-    client1.on_event(on_event1)
-    client2.on_event(on_event2)
-
-    loop1 = asyncio.create_task(client1.run_event_loop())
-    loop2 = asyncio.create_task(client2.run_event_loop())
-
-    try:
-        await client1.send_command("event.subscribe", {"topics": ["run.*"], "scope": "global"})
-        await client2.send_command("event.subscribe", {"topics": ["run.*"], "scope": "global"})
-        await client1.send_command("agent.run", {"goal": "broadcast test"})
-
-        await asyncio.wait_for(
-            asyncio.gather(event1.wait(), event2.wait()),
-            timeout=5.0,
-        )
-    finally:
-        loop1.cancel()
-        loop2.cancel()
-        await asyncio.gather(loop1, loop2, return_exceptions=True)
-        await client1.close()
-        await client2.close()
-
-
-# 功能：验证客户端断开后使用 replay_from_run 重连，订阅响应中 replayed_count > 0
-# 设计：client1 触发 run 并等到 run.started 落盘（run.started 在 LLM 调用前写入 events.jsonl），
-#       稍作等待后断开；client2 用 replay_from_run=run_id 订阅，断言 replayed_count > 0，
-#       不依赖 API Key，只需验证 replay 机制读出了已落盘的 run.started
-async def test_disconnect_and_replay_from_run(
-    running_daemon: subprocess.Popen[bytes],
-    free_port: int,
-) -> None:
-    # Phase 1: trigger a run and wait for run.started to be written to disk
-    client1 = SocketClient("127.0.0.1", free_port)
-    await client1.connect()
-
-    started_event: asyncio.Event = asyncio.Event()
-    run_id_holder: list[str] = []
-
-    async def on_event(event: dict[str, Any]) -> None:
-        if event.get("type") == "run.started":
-            run_id_holder.append(event.get("run_id", ""))
-            started_event.set()
-
-    client1.on_event(on_event)
-    loop1 = asyncio.create_task(client1.run_event_loop())
-
-    try:
-        await client1.send_command("event.subscribe", {"topics": ["run.*"], "scope": "global"})
-        await client1.send_command("agent.run", {"goal": "replay test"})
-        await asyncio.wait_for(started_event.wait(), timeout=5.0)
-    finally:
-        loop1.cancel()
-        await asyncio.gather(loop1, return_exceptions=True)
-        await client1.close()
-
-    assert run_id_holder, "run.started was never received"
-    run_id = run_id_holder[0]
-
-    # Brief pause to ensure the event is flushed to disk before we replay
-    await asyncio.sleep(0.05)
-
-    # Phase 2: reconnect with replay_from_run and verify replayed_count > 0
-    client2 = SocketClient("127.0.0.1", free_port)
-    await client2.connect()
-    loop2 = asyncio.create_task(client2.run_event_loop())
-
-    try:
-        result = await client2.send_command(
-            "event.subscribe",
-            {
-                "topics": ["run.*"],
-                "scope": "global",
-                "replay_from_run": run_id,
-            },
-        )
-        assert result.get("replayed_count", 0) > 0, (
-            f"Expected replayed_count > 0 for run_id={run_id!r}, got {result}"
-        )
-    finally:
-        loop2.cancel()
-        await asyncio.gather(loop2, return_exceptions=True)
-        await client2.close()
+    # ── LLM cache stats are present ──────────────────────────────────────────
+    usage_events = [e for e in events if e["type"] == "llm.usage"]
+    assert len(usage_events) >= 1
+    for ue in usage_events:
+        assert "input_tokens" in ue
+        assert "output_tokens" in ue
+        assert "cache_read_input_tokens" in ue

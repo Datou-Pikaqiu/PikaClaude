@@ -1,6 +1,6 @@
-from kama_claude.core.session.manager import SessionManager
-from kama_claude.core.session.model import Session, SessionMode, SessionStatus
-from kama_claude.core.session.store import MessageContent, SessionStore
+from pika_claude.core.session.manager import SessionManager
+from pika_claude.core.session.model import Session, SessionMode, SessionStatus
+from pika_claude.core.session.store import MessageContent, SessionStore
 
 __all__ = [
     "MessageContent",

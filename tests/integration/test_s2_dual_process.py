@@ -1,144 +1,151 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import subprocess
 from typing import Any
 
-from textual.app import App, ComposeResult
-from textual.binding import Binding
-from textual.widgets import Label, RichLog
-
-from kama_claude.core.transport.socket_client import IpcError, SocketClient
+from pika_claude.core.transport.socket_client import SocketClient
 
 
-class KamaTuiApp(App[None]):
-    """KamaClaude 终端 UI：实时显示 daemon 事件流，支持断线自动重连。"""
+# 功能：验证 agent.run 命令返回非空 run_id，且 daemon 随即广播 run.started 事件
+# 设计：用 SocketClient 封装 IPC 层，asyncio.Event 等待事件而非轮询，
+#       timeout=5s 防测试挂起；run.started 在 LLM 调用前触发，无需真实 API Key
+async def test_agent_run_returns_run_id_and_emits_started(
+    running_daemon: subprocess.Popen[bytes],
+    free_port: int,
+) -> None:
+    client = SocketClient("127.0.0.1", free_port)
+    await client.connect()
 
-    TITLE = "KamaClaude TUI"
-    BINDINGS = [Binding("q", "quit", "Quit")]
-    CSS = """
-    Screen { layout: vertical; }
-    #status {
-        height: 1;
-        background: $primary;
-        color: $text;
-        padding: 0 1;
-    }
-    #log { height: 1fr; }
-    """
+    started_event: asyncio.Event = asyncio.Event()
+    received: dict[str, Any] = {}
 
-    # 初始化连接参数和 token 缓冲区
-    def __init__(self, host: str, port: int, replay_run_id: str | None = None) -> None:
-        super().__init__()
-        self._host = host
-        self._port = port
-        self._replay_run_id = replay_run_id
-        self._token_buf = ""
+    async def on_event(event: dict[str, Any]) -> None:
+        if event.get("type") == "run.started":
+            received.update(event)
+            started_event.set()
 
-    # 构建 UI：顶部状态栏 + 可滚动事件日志
-    def compose(self) -> ComposeResult:
-        yield Label("● connecting...", id="status")
-        yield RichLog(id="log", highlight=True, markup=True)
+    client.on_event(on_event)
+    loop_task = asyncio.create_task(client.run_event_loop())
 
-    # 挂载后启动 socket 连接 worker
-    def on_mount(self) -> None:
-        self.run_worker(self._socket_loop(), exclusive=True, name="socket")
+    try:
+        await client.send_command("event.subscribe", {"topics": ["run.*"], "scope": "global"})
+        result = await client.send_command("agent.run", {"goal": "hello"})
 
-    # 管理 SocketClient 生命周期：连接、订阅、接收事件、断线重连
-    async def _socket_loop(self) -> None:
-        log = self.query_one("#log", RichLog)
-        status = self.query_one("#status", Label)
+        assert result.get("run_id"), "run_id must be non-empty"
+        returned_run_id: str = result["run_id"]
 
-        while True:
-            client = SocketClient(self._host, self._port)
-            try:
-                await client.connect()
-            except (ConnectionRefusedError, OSError):
-                status.update("● not connected — retrying in 2s")
-                await asyncio.sleep(2)
-                continue
+        await asyncio.wait_for(started_event.wait(), timeout=5.0)
+        assert received.get("run_id") == returned_run_id
+        assert received.get("goal") == "hello"
+    finally:
+        loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+        await client.close()
 
-            status.update(f"● connected  {self._host}:{self._port}")
-            loop_task = asyncio.create_task(client.run_event_loop())
 
-            async def on_event(event: dict[str, Any]) -> None:
-                self._handle_event(event, log)
+# 功能：验证两个独立客户端同时订阅后，其中一个触发 agent.run，两个都能收到 run.started 广播
+# 设计：两个 SocketClient 并行等待事件（asyncio.gather），确认 IpcEventBroadcaster 的扇出语义；
+#       不需要两个客户端都发命令，只验证广播覆盖所有订阅者
+async def test_two_clients_both_receive_broadcast(
+    running_daemon: subprocess.Popen[bytes],
+    free_port: int,
+) -> None:
+    client1 = SocketClient("127.0.0.1", free_port)
+    client2 = SocketClient("127.0.0.1", free_port)
+    await client1.connect()
+    await client2.connect()
 
-            client.on_event(on_event)
+    event1: asyncio.Event = asyncio.Event()
+    event2: asyncio.Event = asyncio.Event()
 
-            try:
-                params: dict[str, Any] = {
-                    "topics": [
-                        "run.*", "step.*", "tool.*",
-                        "llm.token", "llm.usage", "log.*",
-                    ],
-                    "scope": "global",
-                }
-                if self._replay_run_id is not None:
-                    params["replay_from_run"] = self._replay_run_id
-                await client.send_command("event.subscribe", params)
-                await loop_task
-            except IpcError as e:
-                status.update(f"● subscribe error — {e}")
-            finally:
-                if not loop_task.done():
-                    loop_task.cancel()
-                self._flush_tokens(log)
-                await client.close()
+    async def on_event1(event: dict[str, Any]) -> None:
+        if event.get("type") == "run.started":
+            event1.set()
 
-            status.update("● disconnected — retrying in 2s")
-            await asyncio.sleep(2)
+    async def on_event2(event: dict[str, Any]) -> None:
+        if event.get("type") == "run.started":
+            event2.set()
 
-    # 将 llm.token 累积缓冲区写入日志并清空
-    def _flush_tokens(self, log: RichLog) -> None:
-        if self._token_buf:
-            log.write(self._token_buf)
-            self._token_buf = ""
+    client1.on_event(on_event1)
+    client2.on_event(on_event2)
 
-    # 根据事件 type 字段格式化并写入 RichLog，llm.token 累积后整体写入
-    def _handle_event(self, event: dict[str, Any], log: RichLog) -> None:
-        t = event.get("type", "")
+    loop1 = asyncio.create_task(client1.run_event_loop())
+    loop2 = asyncio.create_task(client2.run_event_loop())
 
-        if t == "llm.token":
-            self._token_buf += event.get("token", "")
-            return
+    try:
+        await client1.send_command("event.subscribe", {"topics": ["run.*"], "scope": "global"})
+        await client2.send_command("event.subscribe", {"topics": ["run.*"], "scope": "global"})
+        await client1.send_command("agent.run", {"goal": "broadcast test"})
 
-        self._flush_tokens(log)
+        await asyncio.wait_for(
+            asyncio.gather(event1.wait(), event2.wait()),
+            timeout=5.0,
+        )
+    finally:
+        loop1.cancel()
+        loop2.cancel()
+        await asyncio.gather(loop1, loop2, return_exceptions=True)
+        await client1.close()
+        await client2.close()
 
-        if t == "run.started":
-            log.write(
-                f"[bold blue]▶ run[/bold blue]  {event.get('run_id', '')}  "
-                f"{event.get('goal', '')}"
-            )
-        elif t == "step.started":
-            log.write(f"[bold]  step {event.get('step')}[/bold]  planning...")
-        elif t == "tool.call_started":
-            params_str = json.dumps(event.get("params", {}), ensure_ascii=False)
-            log.write(f"[green]  tool[/green]  {event.get('tool_name', '')}  {params_str}")
-        elif t == "tool.call_finished":
-            log.write(
-                f"[green]  tool[/green]  {event.get('tool_name', '')} "
-                f"✓  {event.get('elapsed_ms')}ms"
-            )
-        elif t == "tool.call_failed":
-            log.write(
-                f"[red]  tool[/red]  {event.get('tool_name', '')} "
-                f"✗  {event.get('error_message', '')}"
-            )
-        elif t == "step.finished":
-            log.write(f"  step {event.get('step')}  done")
-        elif t == "run.finished":
-            s = event.get("status", "")
-            color = "green" if s == "success" else "red"
-            log.write(f"[{color}]■ run[/{color}]  {s}  {event.get('steps')} steps")
-        elif t == "llm.usage":
-            log.write(
-                f"[dim]  usage[/dim]  in={event.get('input_tokens')} "
-                f"out={event.get('output_tokens')} "
-                f"cache_read={event.get('cache_read_input_tokens')}"
-            )
-        elif t == "log.line":
-            level = event.get("level", "INFO")
-            log.write(
-                f"[dim]{level}[/dim]  {event.get('source', '')}  {event.get('message', '')}"
-            )
+
+# 功能：验证客户端断开后使用 replay_from_run 重连，订阅响应中 replayed_count > 0
+# 设计：client1 触发 run 并等到 run.started 落盘（run.started 在 LLM 调用前写入 events.jsonl），
+#       稍作等待后断开；client2 用 replay_from_run=run_id 订阅，断言 replayed_count > 0，
+#       不依赖 API Key，只需验证 replay 机制读出了已落盘的 run.started
+async def test_disconnect_and_replay_from_run(
+    running_daemon: subprocess.Popen[bytes],
+    free_port: int,
+) -> None:
+    # Phase 1: trigger a run and wait for run.started to be written to disk
+    client1 = SocketClient("127.0.0.1", free_port)
+    await client1.connect()
+
+    started_event: asyncio.Event = asyncio.Event()
+    run_id_holder: list[str] = []
+
+    async def on_event(event: dict[str, Any]) -> None:
+        if event.get("type") == "run.started":
+            run_id_holder.append(event.get("run_id", ""))
+            started_event.set()
+
+    client1.on_event(on_event)
+    loop1 = asyncio.create_task(client1.run_event_loop())
+
+    try:
+        await client1.send_command("event.subscribe", {"topics": ["run.*"], "scope": "global"})
+        await client1.send_command("agent.run", {"goal": "replay test"})
+        await asyncio.wait_for(started_event.wait(), timeout=5.0)
+    finally:
+        loop1.cancel()
+        await asyncio.gather(loop1, return_exceptions=True)
+        await client1.close()
+
+    assert run_id_holder, "run.started was never received"
+    run_id = run_id_holder[0]
+
+    # Brief pause to ensure the event is flushed to disk before we replay
+    await asyncio.sleep(0.05)
+
+    # Phase 2: reconnect with replay_from_run and verify replayed_count > 0
+    client2 = SocketClient("127.0.0.1", free_port)
+    await client2.connect()
+    loop2 = asyncio.create_task(client2.run_event_loop())
+
+    try:
+        result = await client2.send_command(
+            "event.subscribe",
+            {
+                "topics": ["run.*"],
+                "scope": "global",
+                "replay_from_run": run_id,
+            },
+        )
+        assert result.get("replayed_count", 0) > 0, (
+            f"Expected replayed_count > 0 for run_id={run_id!r}, got {result}"
+        )
+    finally:
+        loop2.cancel()
+        await asyncio.gather(loop2, return_exceptions=True)
+        await client2.close()

@@ -25,7 +25,7 @@ git clone <repo> && cd PikaClaude
 uv sync
 cp .env.example .env        # 按需修改
 
-uv run Pika-core &          # 启动守护进程（后台）
+uv run Pika-core           # 启动守护进程（后台）
 uv run Pika ping            # 验证连通：应返回 pong
 uv run Pika --version       # 应输出 0.0.1
 ```

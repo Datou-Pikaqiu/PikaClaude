@@ -54,12 +54,12 @@ cp .env.example .env
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `pika_CONFIG` | `~/.pika/config.toml` | 覆盖配置文件路径 |
-| `pika_HOST` | `127.0.0.1` | TCP 监听地址 |
-| `pika_PORT` | `7437` | TCP 监听端口 |
-| `pika_LOG_LEVEL` | `INFO` | 日志级别（DEBUG / INFO / WARNING / ERROR） |
-| `pika_LOG_FILE` | `~/.pika/logs/core.log` | 日志文件路径（留空则仅输出 stderr） |
-| `pika_LOG_FORMAT` | `text` | 日志格式（`text` 或 `json`） |
+| `PIKA_CONFIG` | `~/.pika/config.toml` | 覆盖配置文件路径 |
+| `PIKA_HOST` | `127.0.0.1` | TCP 监听地址 |
+| `PIKA_PORT` | `7437` | TCP 监听端口 |
+| `PIKA_LOG_LEVEL` | `INFO` | 日志级别（DEBUG / INFO / WARNING / ERROR） |
+| `PIKA_LOG_FILE` | `~/.pika/logs/core.log` | 日志文件路径（留空则仅输出 stderr） |
+| `PIKA_LOG_FORMAT` | `text` | 日志格式（`text` 或 `json`） |
 
 ---
 
@@ -91,5 +91,5 @@ tail -f ~/.pika/logs/core.log
 |------|------|------|
 | `core already running at 127.0.0.1:7437` | 已有守护进程在运行 | `kill $(pgrep -f pika-core)` |
 | `core not running` | 未启动守护进程 | `uv run pika-core` |
-| `Address already in use` | 端口被其他进程占用 | `pika_PORT=8000 uv run pika-core` |
-| `Config error: pika_PORT must be an integer` | `.env` 或环境变量中端口值非整数 | 检查 `pika_PORT` 的值 |
+| `Address already in use` | 端口被其他进程占用 | `PIKA_PORT=8000 uv run pika-core` |
+| `Config error: PIKA_PORT must be an integer` | `.env` 或环境变量中端口值非整数 | 检查 `PIKA_PORT` 的值 |

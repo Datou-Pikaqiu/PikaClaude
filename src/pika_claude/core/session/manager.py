@@ -6,21 +6,24 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from kama_claude.core.bus.envelope import HandlerError
-from kama_claude.core.bus.events import (
+from pika_claude.core.bus.envelope import HandlerError
+from pika_claude.core.bus.events import (
     SessionClosedEvent,
     SessionCreatedEvent,
     SessionMessageReceivedEvent,
     SessionResumedEvent,
     SessionWaitingForInputEvent,
+    SkillInvokedEvent,
 )
-from kama_claude.core.events.bus import EventBus
-from kama_claude.core.runs import new_run_id
-from kama_claude.core.session.model import Session, SessionMode
-from kama_claude.core.session.store import SessionStore
+from pika_claude.core.events.bus import EventBus
+from pika_claude.core.runs import new_run_id
+from pika_claude.core.session.model import Session, SessionMode
+from pika_claude.core.session.store import SessionStore
+from pika_claude.core.skills.loader import SkillLoader
 
 if TYPE_CHECKING:
-    from kama_claude.core.runner import AgentRunner
+    from pika_claude.core.llm.base import LLMProvider
+    from pika_claude.core.runner import AgentRunner
 
 SESSION_NOT_FOUND = -32010
 SESSION_CLOSED = -32011
@@ -33,18 +36,21 @@ def _now() -> str:
 
 
 class SessionManager:
-    # 初始化会话管理器，接入文件存储、runner 工厂和事件总线
+    # 初始化会话管理器，接入文件存储、runner 工厂、事件总线和可选的 LLM provider（用于手动压缩）
     def __init__(
         self,
         store: SessionStore,
         runner_factory: Callable[[], AgentRunner],
         bus: EventBus,
+        provider: LLMProvider | None = None,
     ) -> None:
         self._store = store
         self._runner_factory = runner_factory
         self._bus = bus
+        self._provider = provider
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._skill_loader = SkillLoader()
 
     # 创建新 session 并写入 meta.json
     async def create(self, mode: SessionMode, title: str = "") -> Session:
@@ -92,12 +98,36 @@ class SessionManager:
             session.updated_at = _now()
             self._store.write_meta(session)
 
+            # Skill 解析：检测 "/" 前缀，展开为系统提示覆盖和工具白名单
+            goal = content
+            system_prompt_override: str | None = None
+            tool_whitelist: list[str] | None = None
+            if content.startswith("/"):
+                parts = content[1:].split(None, 1)
+                skill_name = parts[0]
+                arguments = parts[1] if len(parts) > 1 else ""
+                skill = self._skill_loader.resolve(skill_name)
+                if skill is not None:
+                    goal = self._skill_loader.render_prompt(skill, arguments)
+                    system_prompt_override = skill.system_prompt_template
+                    tool_whitelist = skill.allowed_tools or None
+                    await self._bus.publish(
+                        SkillInvokedEvent(
+                            skill_name=skill_name,
+                            arguments=arguments,
+                            run_id=run_id,
+                            ts=_now(),
+                        )
+                    )
+
             runner = self._runner_factory()
             await runner.run_and_capture(
-                content,
+                goal,
                 run_id=run_id,
                 session=session,
                 store=self._store,
+                system_prompt_override=system_prompt_override,
+                tool_whitelist=tool_whitelist,
             )
 
             session.updated_at = _now()
@@ -127,6 +157,32 @@ class SessionManager:
             session.updated_at = _now()
             self._store.write_meta(session)
             await self._bus.publish(SessionClosedEvent(session_id=sid, ts=session.updated_at))
+
+    # 手动压缩指定 session 的 thread，将摘要持久化写入 thread.jsonl
+    async def compact(self, sid: str, focus: str = "") -> Any:
+        self._get_session(sid)
+        lock = self._locks[sid]
+        if lock.locked():
+            raise HandlerError(SESSION_BUSY, "session busy")
+        if self._provider is None:
+            raise HandlerError(-32020, "provider not available for compaction")
+        async with lock:
+            from pika_claude.core.bus.commands import SessionCompactResult
+            from pika_claude.core.compact.compactor import Compactor
+            messages = self._store.read_messages(sid)
+            session_dir = self._store.session_dir(sid)
+            compactor = Compactor(self._bus, session_dir, sid)
+            result = await compactor.compact_messages(messages, self._provider, focus=focus)
+            if result is None:
+                raise HandlerError(-32021, "compaction failed or not beneficial")
+            self._store.write_compacted(sid, [
+                {"role": "user", "content": result.summary_text},
+                {"role": "assistant", "content": "Understood, I'll continue from this summary."},
+            ])
+            return SessionCompactResult(
+                summary_tokens=result.summary_tokens,
+                saved_tokens=max(0, result.original_token_estimate - result.summary_tokens),
+            )
 
     # 读取指定 session 的完整 thread 历史
     async def get_history(self, sid: str) -> list[dict[str, Any]]:

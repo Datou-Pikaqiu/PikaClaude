@@ -1,4 +1,4 @@
-from kama_claude.core.task.manager import TaskManager
-from kama_claude.core.task.model import Task, TaskStatus
+from pika_claude.core.task.manager import TaskManager
+from pika_claude.core.task.model import Task, TaskStatus
 
 __all__ = ["Task", "TaskManager", "TaskStatus"]
