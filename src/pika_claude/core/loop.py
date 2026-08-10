@@ -52,7 +52,7 @@ class AgentLoop:
                 StepStartedEvent(run_id=context.run_id, step=context.step, ts=_now())
             )
 
-            # [plan] call LLM — API errors terminate the run
+            # [计划]调用LLM-API错误终止运行
             try:
                 response = await self._provider.chat(
                     messages=context.messages,
@@ -77,8 +77,8 @@ class AgentLoop:
                 context.mark_failed("llm_error")
                 break
 
-            # [observe] append assistant content blocks to context
-            # thinking blocks must come first and be preserved verbatim for extended thinking mode
+            # [观察]将辅助内容块附加到上下文中
+            # 思维块必须放在首位，并逐字保存，以扩展思维模式
             blocks: list[dict[str, object]] = list(response.thinking_blocks)
             if response.text:
                 blocks.append({"type": "text", "text": response.text})
@@ -88,7 +88,7 @@ class AgentLoop:
                 )
             context.add_assistant_message(blocks)
 
-            # [act] execute each requested tool; errors become tool results so loop continues
+            # [act] 执行每个请求的工具；错误成为工具结果，因此循环继续
             if response.stop_reason == "tool_use":
                 for tc in response.tool_calls:
                     result = await invoke_tool(
@@ -98,8 +98,8 @@ class AgentLoop:
                     )
                     context.add_tool_result(tc.id, result.content, is_error=result.is_error)
             elif response.stop_reason == "max_tokens" and response.tool_calls:
-                # Output token limit hit mid-tool-call; input is incomplete.
-                # Add synthetic error results so the conversation stays balanced.
+                # 输出令牌限制在工具调用过程中命中；输入不完整
+                # 添加合成错误结果，使对话保持平衡
                 for tc in response.tool_calls:
                     context.add_tool_result(
                         tc.id,
@@ -108,7 +108,7 @@ class AgentLoop:
                         is_error=True,
                     )
 
-            # Termination check — end_turn wins over max_steps if both hit on same step
+            # 终止检查——如果end_turn和max_steps都在同一步上，则end_turns将战胜max_stepers
             if response.stop_reason == "end_turn":
                 context.result = response.text or ""
                 context.mark_success()
